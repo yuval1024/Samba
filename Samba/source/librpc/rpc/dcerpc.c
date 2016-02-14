@@ -332,6 +332,8 @@ static NTSTATUS ncacn_push_request_sign(struct dcerpc_connection *c,
 	struct ndr_push *ndr;
 	DATA_BLOB creds2;
 	size_t payload_length;
+	
+	size_t hdr_size = DCERPC_REQUEST_LENGTH;
 
 	/* non-signed packets are simpler */
 	if (!c->security_state.auth_info ||
@@ -350,6 +352,7 @@ static NTSTATUS ncacn_push_request_sign(struct dcerpc_connection *c,
 
 	if (pkt->pfc_flags & DCERPC_PFC_FLAG_ORPC) {
 		ndr->flags |= LIBNDR_FLAG_OBJECT_PRESENT;
+		hdr_size += 16;
 	}
 
 	status = ndr_push_ncacn_packet(ndr, NDR_SCALARS|NDR_BUFFERS, pkt);
@@ -380,9 +383,12 @@ static NTSTATUS ncacn_push_request_sign(struct dcerpc_connection *c,
 		break;
 
 	case DCERPC_AUTH_LEVEL_CONNECT:
+	if ( (c->security_state.auth_info == NULL) || 
+	    (c->security_state.auth_info->auth_type==DCERPC_AUTH_TYPE_NTLMSSP) ) {
 		status = dcerpc_connect_verifier(mem_ctx, &c->security_state.auth_info->credentials);
 		break;
-
+        }
+	
 	case DCERPC_AUTH_LEVEL_NONE:
 		c->security_state.auth_info->credentials = data_blob(NULL, 0);
 		break;
@@ -396,11 +402,15 @@ static NTSTATUS ncacn_push_request_sign(struct dcerpc_connection *c,
 		return status;
 	}
 
+if ( (c->security_state.auth_info == NULL) || 
+	(c->security_state.auth_info->auth_level>DCERPC_AUTH_LEVEL_CONNECT) ||
+	(c->security_state.auth_info->auth_type==DCERPC_AUTH_TYPE_NTLMSSP)) {
 	/* add the auth verifier */
 	status = ndr_push_dcerpc_auth(ndr, NDR_SCALARS|NDR_BUFFERS, c->security_state.auth_info);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
+}
 
 	/* extract the whole packet as a blob */
 	*blob = ndr_push_blob(ndr);
@@ -418,7 +428,7 @@ static NTSTATUS ncacn_push_request_sign(struct dcerpc_connection *c,
 	case DCERPC_AUTH_LEVEL_PRIVACY:
 		status = gensec_seal_packet(c->security_state.generic_state,
 					    mem_ctx,
-					    blob->data + DCERPC_REQUEST_LENGTH,
+					    blob->data + hdr_size,
 					    payload_length,
 					    blob->data,
 					    blob->length -
@@ -446,7 +456,7 @@ static NTSTATUS ncacn_push_request_sign(struct dcerpc_connection *c,
 	case DCERPC_AUTH_LEVEL_INTEGRITY:
 		status = gensec_sign_packet(c->security_state.generic_state,
 					    mem_ctx,
-					    blob->data + DCERPC_REQUEST_LENGTH,
+					    blob->data + hdr_size,
 					    payload_length,
 					    blob->data,
 					    blob->length -

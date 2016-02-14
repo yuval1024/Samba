@@ -1001,6 +1001,51 @@ static NTSTATUS gensec_gssapi_unseal_packet(struct gensec_security *gensec_secur
 	}
 	return NT_STATUS_OK;
 }
+NTSTATUS gssapi_sign_packet(gss_ctx_id_t gssapi_context,
+			    const gss_OID mech,
+			    bool hdr_signing,
+			    const uint8_t *data, size_t length,
+			    const uint8_t *whole_pdu, size_t pdu_length,
+			    TALLOC_CTX *mem_ctx,
+			    DATA_BLOB *sig)
+{
+	OM_uint32 maj_stat, min_stat;
+	gss_buffer_desc input_token, output_token;
+
+	if (hdr_signing) {
+		input_token.length = pdu_length;
+		input_token.value = discard_const_p(uint8_t *, whole_pdu);
+	} else {
+		input_token.length = length;
+		input_token.value = discard_const_p(uint8_t *, data);
+	}
+
+	maj_stat = gss_get_mic(&min_stat,
+			       gssapi_context,
+			       GSS_C_QOP_DEFAULT,
+			       &input_token,
+			       &output_token);
+	if (GSS_ERROR(maj_stat)) {
+		char *error_string = gssapi_error_string(mem_ctx,
+							 maj_stat,
+							 min_stat,
+							 mech);
+		DEBUG(1, ("GSS GetMic failed: %s\n", error_string));
+		talloc_free(error_string);
+		return NT_STATUS_ACCESS_DENIED;
+	}
+
+	*sig = data_blob_talloc(mem_ctx, (uint8_t *)output_token.value, output_token.length);
+	gss_release_buffer(&min_stat, &output_token);
+	if (sig->data == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	dump_data_pw("gssapi_sign_packet: sig\n", sig->data, sig->length);
+
+	return NT_STATUS_OK;
+}
+
 
 static NTSTATUS gensec_gssapi_sign_packet(struct gensec_security *gensec_security, 
 					  TALLOC_CTX *mem_ctx, 
@@ -1010,41 +1055,74 @@ static NTSTATUS gensec_gssapi_sign_packet(struct gensec_security *gensec_securit
 {
 	struct gensec_gssapi_state *gensec_gssapi_state
 		= talloc_get_type(gensec_security->private_data, struct gensec_gssapi_state);
+	bool hdr_signing = false;
+	NTSTATUS status;
+
+	if (gensec_security->want_features & GENSEC_FEATURE_SIGN_PKT_HEADER) {		
+		DEBUG(1, ("enable header signing; %d\n", gensec_security->want_features));	
+		hdr_signing = true;
+	}
+
+
+	status = gssapi_sign_packet(gensec_gssapi_state->gssapi_context,
+				    gensec_gssapi_state->gss_oid,
+				    hdr_signing,
+				    data, length,
+				    whole_pdu, pdu_length,
+				    mem_ctx, sig);
+	if (!NT_STATUS_IS_OK(status)) {
+		DEBUG(0, ("gssapi_sign_packet(hdr_signing=%u,"
+			  "data=%zu,pdu=%zu) failed: %s\n",
+			  hdr_signing, length, pdu_length,
+			  nt_errstr(status)));
+		return status;
+	}
+
+	return NT_STATUS_OK;
+}
+
+
+static
+NTSTATUS gssapi_check_packet(gss_ctx_id_t gssapi_context,
+			     const gss_OID mech,
+			     bool hdr_signing,
+			     const uint8_t *data, size_t length,
+			     const uint8_t *whole_pdu, size_t pdu_length,
+			     const DATA_BLOB *sig)
+{
 	OM_uint32 maj_stat, min_stat;
-	gss_buffer_desc input_token, output_token;
-	int conf_state;
-	ssize_t sig_length = 0;
+	gss_buffer_desc input_token;
+	gss_buffer_desc input_message;
+	gss_qop_t qop_state;
 
-	input_token.length = length;
-	input_token.value = discard_const_p(uint8_t *, data);
+	dump_data_pw("gssapi_check_packet: sig\n", sig->data, sig->length);
 
-	maj_stat = gss_wrap(&min_stat, 
-			    gensec_gssapi_state->gssapi_context,
-			    0,
-			    GSS_C_QOP_DEFAULT,
-			    &input_token,
-			    &conf_state,
-			    &output_token);
+	if (hdr_signing) {
+		input_message.length = pdu_length;
+		input_message.value = discard_const(whole_pdu);
+	} else {
+		input_message.length = length;
+		input_message.value = discard_const(data);
+	}
+
+	input_token.length = sig->length;
+	input_token.value = sig->data;
+
+	maj_stat = gss_verify_mic(&min_stat,
+				  gssapi_context,
+				  &input_message,
+				  &input_token,
+				  &qop_state);
 	if (GSS_ERROR(maj_stat)) {
-		DEBUG(1, ("GSS Wrap failed: %s\n", 
-			  gssapi_error_string(mem_ctx, maj_stat, min_stat, gensec_gssapi_state->gss_oid)));
+		char *error_string = gssapi_error_string(NULL,
+							 maj_stat,
+							 min_stat,
+							 mech);
+		DEBUG(1, ("GSS VerifyMic failed: %s\n", error_string));
+		talloc_free(error_string);
+
 		return NT_STATUS_ACCESS_DENIED;
 	}
-
-	if (output_token.length < input_token.length) {
-		DEBUG(1, ("gensec_gssapi_sign_packet: GSS Wrap length [%ld] *less* than caller length [%ld]\n", 
-			  (long)output_token.length, (long)length));
-		return NT_STATUS_INTERNAL_ERROR;
-	}
-
-	/* Caller must pad to right boundary */
-	sig_length = output_token.length - input_token.length;
-
-	*sig = data_blob_talloc(mem_ctx, (uint8_t *)output_token.value, sig_length);
-
-	dump_data_pw("gensec_gssapi_seal_packet: sig\n", sig->data, sig->length);
-
-	gss_release_buffer(&min_stat, &output_token);
 
 	return NT_STATUS_OK;
 }
@@ -1062,36 +1140,34 @@ static NTSTATUS gensec_gssapi_check_packet(struct gensec_security *gensec_securi
 	int conf_state;
 	gss_qop_t qop_state;
 	DATA_BLOB in;
+	bool hdr_signing = false;
+    NTSTATUS status;
 
-	dump_data_pw("gensec_gssapi_seal_packet: sig\n", sig->data, sig->length);
+	dump_data_pw("gensec_gssapi_check_packet: sig\n", sig->data, sig->length);
 
-	in = data_blob_talloc(mem_ctx, NULL, sig->length + length);
+	if (gensec_security->want_features & GENSEC_FEATURE_SIGN_PKT_HEADER) {
+		DEBUG(1, ("enable header signing; %d\n", gensec_security->want_features));	
+		hdr_signing = true;
+	}
 
-	memcpy(in.data, sig->data, sig->length);
-	memcpy(in.data + sig->length, data, length);
-
-	input_token.length = in.length;
-	input_token.value = in.data;
 	
-	maj_stat = gss_unwrap(&min_stat, 
-			      gensec_gssapi_state->gssapi_context, 
-			      &input_token,
-			      &output_token, 
-			      &conf_state,
-			      &qop_state);
-	if (GSS_ERROR(maj_stat)) {
-		DEBUG(1, ("GSS UnWrap failed: %s\n", 
-			  gssapi_error_string(mem_ctx, maj_stat, min_stat, gensec_gssapi_state->gss_oid)));
-		return NT_STATUS_ACCESS_DENIED;
-	}
+	status = gssapi_check_packet(gensec_gssapi_state->gssapi_context,
+				     gensec_gssapi_state->gss_oid,
+				     hdr_signing,
+				     data, length,
+				     whole_pdu, pdu_length,
+				     sig);
 
-	if (output_token.length != length) {
-		return NT_STATUS_INTERNAL_ERROR;
+	if (!NT_STATUS_IS_OK(status)) {
+		DEBUG(0, ("gssapi_check_packet(hdr_signing=%u,sig_size=%zu,"
+			  "data=%zu,pdu=%zu) failed: %s\n",
+			  hdr_signing, sig->length, length, pdu_length,
+			  nt_errstr(status)));
+		return status;
 	}
-
-	gss_release_buffer(&min_stat, &output_token);
 
 	return NT_STATUS_OK;
+
 }
 
 /* Try to figure out what features we actually got on the connection */
