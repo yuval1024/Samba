@@ -91,6 +91,7 @@ static NTSTATUS dcerpc_binding_from_STRINGBINDING(TALLOC_CTX *mem_ctx,
     }
 
     b->host = host;
+    b->target_hostname = b->host;
     b->endpoint = talloc_strdup(b, endpoint);
 
     *b_out = b;
